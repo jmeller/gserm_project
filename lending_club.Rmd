@@ -1,0 +1,180 @@
+---
+title: 'First Draft Lending Club Model'
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r data_loading}
+library(data.table)
+library(randomForest)
+library(ranger)
+library(magrittr)
+library(caret)
+library(dplyr)
+library(tidyverse)
+
+train.raw <- fread("lending_club_train.csv", stringsAsFactors = T)
+test.raw <- fread("lending_club_test.csv", stringsAsFactors = T)
+
+
+```
+```{r data_preprocessing}
+feat.manual <- c("acc_now_delinq", "avg_cur_bal", 
+                 "collection_recovery_fee", "collections_12_mths_ex_med", "delinq_2yrs",
+                 "delinq_amnt", "fico_range_high", "fico_range_low",
+                 "funded_amnt", "funded_amnt_inv", "int_rate",
+                 "last_fico_range_high", "last_fico_range_low", "last_pymnt_amnt", 
+                 "last_pymnt_d", "loan_amnt", "loan_status", 
+                 "num_accts_ever_120_pd", "num_rev_tl_bal_gt_0", "num_sats",
+                 "num_tl_30dpd", "num_tl_90g_dpd_24m", "num_tl_op_past_12m", "open_acc", 
+                 "pct_tl_nvr_dlq", "pub_rec_bankruptcies", 
+                 "sub_grade", "tot_coll_amt", "tot_cur_bal",
+                 "tot_hi_cred_lim", "total_acc", "total_bal_ex_mort",
+                 "total_bc_limit", "total_il_high_credit_limit", "total_rec_int", 
+                 "total_rec_late_fee", "total_rec_prncp", "total_rev_hi_lim", 
+                 "revol_util", "last_credit_pull_d", "term")
+
+data.raw <- union(
+  # the mutate function adds a source so we can split it again later
+  train.raw %>% mutate(data_source = "train"),
+  test.raw %>% mutate(data_source = "test", default = as.integer(default))
+) %>% data.table() %>%
+  .[, !which(names(.) %in% c("last_fico_range_low", "last_fico_range_high")), with = F] %>%
+  .[,`:=`(emp_title = factor(emp_title),
+          desc = factor(desc),
+          title = factor(title),
+          zip_code = factor(zip_code),
+          earliest_cr_line = factor(earliest_cr_line),
+          revol_util = as.numeric(str_replace_all(revol_util, "[%]", "")))]
+rm(train.raw, test.raw)
+
+# cleaning
+data.raw[, default := factor(default, levels = c("0","1"), labels = c("no_default", "default"))]
+
+# remove cols with > 75% missing data
+fill.rates <- data.raw[,lapply(.SD, 
+                               function(col) sum(1 - as.integer(is.na(col)))/nrow(data.raw)), 
+                       .SDcols = names(data.raw)] %>% unlist
+cols.filled <- fill.rates[which(fill.rates == 1)]
+cols.wNAs <- fill.rates[which(fill.rates < 1 & fill.rates > 0.75)]
+data.completeCols <- data.raw[, c("default", names(cols.filled)), 
+                              with = F]
+data.wNAs <- data.raw[, c("id", names(cols.wNAs)), with = F]
+
+
+# impute NAs by means
+impute.cols <- names(data.wNAs)[which(!names(data.wNAs) == "id")]
+data.wNAs <- data.wNAs[,paste0("dmi_", impute.cols) := # add dmis
+                           lapply(.SD, function(col) ifelse(is.na(col), 1, 0)),
+                         .SDcols = impute.cols]
+data.imputed <- data.wNAs[,(impute.cols) := 
+                              lapply(.SD, function(col) 
+                                ifelse(is.na(col), mean(col, na.rm = T), col)), 
+                            .SDcols = impute.cols]
+# merge back
+data.preprocessed <- merge(data.completeCols, data.imputed, by = "id")
+
+
+# feature engineering
+data.preprocessed[,`:=`(emp_title = as.factor(ifelse(str_detect(tolower(emp_title), "manager|director|ceo"),
+                                                 "executive",
+                                                 ifelse(str_detect(tolower(emp_title), "engineer|specialist"),
+                                                        "specialist",
+                                                        "other"))),
+                        last_credit_pull_d_month = as.factor(str_sub(last_credit_pull_d, 1,3)),
+                        last_credit_pull_d_year = as.factor(str_sub(last_credit_pull_d, 5,8)),
+                        last_credit_pull_d = NULL)]
+
+# clean up memory
+rm(data.imputed, data.completeCols, data.wNAs)
+```
+
+
+# Feature selection
+```{r feature_selection}
+train <- data.preprocessed[data_source == "train"] %>% .[,!which(names(.) %in% 
+                                                                   c("id", "data_source")), 
+                                                         with = F]
+
+set.seed(2608)
+# subset.train <- train[sample(1:nrow(train), 10000),
+#                     which(names(train) %in% c("default", feat.manual)), with = F]
+# feature importance based on downsampled training data
+downSample(train, train$default) %>% select(-Class) -> train.downsample
+# subset.train <- train[sample(1:nrow(train), 20000), ]
+
+fit <- ranger(default ~ ., train.downsample, importance = "impurity", num.trees = 100)
+importance.feat <- importance(fit) %>% .[order(., decreasing = T)]
+importance.feat
+
+top10.feat <- names(importance.feat)[1:10]
+top10.feat
+
+manual.feat <- c("acc_now_delinq", "delinq_amnt", "fico_range_low", 
+                 "num_tl_30dpd", "pct_tl_nvr_dlq", "revol_util")
+
+final.feat <- union(top10.feat, manual.feat)
+
+# clean up memory
+rm(train.downsample)
+```
+# Model tuning and evaluation
+```{r evaluation}
+
+library(caret)
+set.seed(2608)
+# train.data_set
+train.data.all <- train[, c("default", final.feat), with = F]
+train.data.subset <- train.data.all[sample(1:nrow(train), 350000)] # larger training sets kill my memory...
+
+ranger.grid <- expand.grid(mtry = 4, splitrule = "gini", min.node.size = 1)
+
+# create the caret experiment using the trainControl() function
+ctrl <- trainControl(
+  method = "none", number = 5, # 10-fold CV
+  selectionFunction = "best", # select the best performer
+  classProbs = TRUE, # requested the predicted probs (for ROC)
+  summaryFunction = twoClassSummary, # needed to produce the ROC/AUC measures
+  savePredictions = TRUE # needed to plot the ROC curves
+)
+
+# train the decision tree model using 10-fold CV
+m.ranger <- train(default ~ .,
+                 data = train.data.subset,
+                 method = "ranger",
+                 metric = "ROC",
+                 trControl = ctrl, 
+                 tuneGrid = ranger.grid, verbose = T,
+                 num.trees = 250)
+
+m.ranger
+
+# train the logreg model using 10-fold CV
+# library(VGAM)
+# m.logreg <- train(default ~ .,
+#                  data = train.data.subset,
+#                  method = "vglmAdjCat",
+#                  metric = "ROC",
+#                  trControl = ctrl)
+# 
+# m.logreg
+```
+```{r roc}
+library(pROC)
+
+# save the predicted probabilities and actual values for decision tree
+predictions <- predict(m.ranger, train.data.subset, type = "prob")
+roc.ranger <- roc(predictor = predictions$default, response = train.data.subset$default)
+auc.ranger <- round(auc(roc.ranger), 3)
+```
+
+```{r predict}
+test <- data.preprocessed[data_source == "test"] %>% .[,!which(names(.) == "data_source"), with = F]
+test$P_default <- predict(m.ranger, test, type = "prob")$default
+
+final.predictions <- test[,.(id, P_default)] %>% as.data.frame
+
+write_csv(final.predictions, "6.csv")
+```
+
