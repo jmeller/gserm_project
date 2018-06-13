@@ -5,7 +5,7 @@ output:
     df_print: paged
 ---
 
-```{r data_loading}
+```{r data_loading, results = "hide"}
 library(data.table)
 library(randomForest)
 library(ranger)
@@ -14,68 +14,80 @@ library(caret)
 library(dplyr)
 library(tidyverse)
 
+# features not to use
+taboo.list <- c("last_fico_range_high", "last_fico_range_low", "acc_now_delinq")
+
 train.raw <- fread("lending_club_train.csv", stringsAsFactors = T)
 test.raw <- fread("lending_club_test.csv", stringsAsFactors = T)
 
-
 ```
+# Data preprocessing
 ```{r data_preprocessing}
-feat.manual <- c("acc_now_delinq", "avg_cur_bal", 
-                 "collection_recovery_fee", "collections_12_mths_ex_med", "delinq_2yrs",
-                 "delinq_amnt", "fico_range_high", "fico_range_low",
-                 "funded_amnt", "funded_amnt_inv", "int_rate",
-                 "last_fico_range_high", "last_fico_range_low", "last_pymnt_amnt", 
-                 "last_pymnt_d", "loan_amnt", "loan_status", 
-                 "num_accts_ever_120_pd", "num_rev_tl_bal_gt_0", "num_sats",
-                 "num_tl_30dpd", "num_tl_90g_dpd_24m", "num_tl_op_past_12m", "open_acc", 
-                 "pct_tl_nvr_dlq", "pub_rec_bankruptcies", 
-                 "sub_grade", "tot_coll_amt", "tot_cur_bal",
-                 "tot_hi_cred_lim", "total_acc", "total_bal_ex_mort",
-                 "total_bc_limit", "total_il_high_credit_limit", "total_rec_int", 
-                 "total_rec_late_fee", "total_rec_prncp", "total_rev_hi_lim", 
-                 "revol_util", "last_credit_pull_d", "term")
-
+# combine train and test data for data handling
 data.raw <- union(
   # the mutate function adds a source so we can split it again later
-  train.raw %>% mutate(data_source = "train"),
-  test.raw %>% mutate(data_source = "test", default = as.integer(default))
-) %>% data.table() %>%
-  .[, !which(names(.) %in% c("last_fico_range_low", "last_fico_range_high")), with = F] %>%
-  .[,`:=`(emp_title = factor(emp_title),
-          desc = factor(desc),
-          title = factor(title),
+  train.raw[, data_source := "train"],
+  test.raw[, `:=`(data_source = "test",
+                  default = as.integer(default))]
+) 
+
+# manually exclude taboo features
+data.raw %<>% .[,!taboo.list, with = F] %>% .[order(id)]
+
+# clean/transform features
+data.raw %<>% .[,`:=`(title = factor(title),
           zip_code = factor(zip_code),
           earliest_cr_line = factor(earliest_cr_line),
-          revol_util = as.numeric(str_replace_all(revol_util, "[%]", "")))]
+          revol_util = as.numeric(str_replace_all(revol_util, "[%]", "")),
+          default = factor(default, 
+                           levels = c("0","1"), 
+                           labels = c("no_default", "default")))]
+
+# clean memory
 rm(train.raw, test.raw)
+```
+# Missing value handling
+```{r missing value handling}
+# divide data set into subsets w. numeric and categorical data
+col.classes <- sapply(data.raw, class)
+num.features <- which(col.classes %in% c("numeric", "integer"))
+cat.features <- c(1, which(col.classes %in% c("factor", "logical", "character")))
+data.num.features <- data.raw[,num.features, with = F]
+data.cat.features <- data.raw[,cat.features, with = F]
 
-# cleaning
-data.raw[, default := factor(default, levels = c("0","1"), labels = c("no_default", "default"))]
+# cat features: replace NA w. "Missing"
+fill.rates.cat <- data.cat.features[,lapply(.SD, 
+                               function(col) sum(1 - as.integer(is.na(col)))/nrow(data.cat.features)), 
+                       .SDcols = names(data.cat.features)] %>% unlist
+## remove cols w.o. any data
+exclude.cat <- fill.rates.cat[which(fill.rates.cat == 0)] 
+data.cat.features %<>% .[,!names(exclude.cat), with = F]
+data.cat.features %<>% 
+  .[,lapply(.SD, function(col) ifelse(is.na(col), "Missing", col)), 
+    .SDcols = 1:ncol(.)]
 
+# numeric features
+fill.rates.num <- data.num.features[,lapply(.SD, 
+                               function(col) sum(1 - as.integer(is.na(col)))/nrow(data.num.features)), 
+                       .SDcols = names(data.num.features)] %>% unlist
 # remove cols with > 75% missing data
-fill.rates <- data.raw[,lapply(.SD, 
-                               function(col) sum(1 - as.integer(is.na(col)))/nrow(data.raw)), 
-                       .SDcols = names(data.raw)] %>% unlist
-cols.filled <- fill.rates[which(fill.rates == 1)]
-cols.wNAs <- fill.rates[which(fill.rates < 1 & fill.rates > 0.75)]
-data.completeCols <- data.raw[, c("default", names(cols.filled)), 
-                              with = F]
-data.wNAs <- data.raw[, c("id", names(cols.wNAs)), with = F]
-
+cols.wNAs.num <- fill.rates.num[which(fill.rates.num > 0.75)]
+data.wNAs.num <- data.num.features[, c("id", names(cols.wNAs)), with = F]
 
 # impute NAs by means
-impute.cols <- names(data.wNAs)[which(!names(data.wNAs) == "id")]
-data.wNAs <- data.wNAs[,paste0("dmi_", impute.cols) := # add dmis
+impute.cols <- names(data.wNAs.num)[which(!names(data.wNAs.num) == "id")]
+data.wNAs.num <- data.wNAs.num[,paste0("dmi_", impute.cols) := # add dmis
                            lapply(.SD, function(col) ifelse(is.na(col), 1, 0)),
                          .SDcols = impute.cols]
-data.imputed <- data.wNAs[,(impute.cols) := 
+data.imputed <- data.wNAs.num[,(impute.cols) := 
                               lapply(.SD, function(col) 
                                 ifelse(is.na(col), mean(col, na.rm = T), col)), 
                             .SDcols = impute.cols]
 # merge back
 data.preprocessed <- merge(data.completeCols, data.imputed, by = "id")
+```
 
-
+```{r feature engineering}
 # feature engineering
 data.preprocessed[,`:=`(emp_title = as.factor(ifelse(str_detect(tolower(emp_title), "manager|director|ceo"),
                                                  "executive",
@@ -91,8 +103,26 @@ rm(data.imputed, data.completeCols, data.wNAs)
 ```
 
 
+
 # Feature selection
 ```{r feature_selection}
+# manual features
+feat.manual <- c("acc_now_delinq", "avg_cur_bal", 
+                 "collection_recovery_fee", "collections_12_mths_ex_med", "delinq_2yrs",
+                 "delinq_amnt", "fico_range_high", "fico_range_low",
+                 "funded_amnt", "funded_amnt_inv", "int_rate",
+                 "last_fico_range_high", "last_fico_range_low", "last_pymnt_amnt", 
+                 "last_pymnt_d", "loan_amnt", "loan_status", 
+                 "num_accts_ever_120_pd", "num_rev_tl_bal_gt_0", "num_sats",
+                 "num_tl_30dpd", "num_tl_90g_dpd_24m", "num_tl_op_past_12m", "open_acc", 
+                 "pct_tl_nvr_dlq", "pub_rec_bankruptcies", 
+                 "sub_grade", "tot_coll_amt", "tot_cur_bal",
+                 "tot_hi_cred_lim", "total_acc", "total_bal_ex_mort",
+                 "total_bc_limit", "total_il_high_credit_limit", "total_rec_int", 
+                 "total_rec_late_fee", "total_rec_prncp", "total_rev_hi_lim", 
+                 "revol_util", "last_credit_pull_d", "term")
+
+
 train <- data.preprocessed[data_source == "train"] %>% .[,!which(names(.) %in% 
                                                                    c("id", "data_source")), 
                                                          with = F]
@@ -176,5 +206,48 @@ test$P_default <- predict(m.ranger, test, type = "prob")$default
 final.predictions <- test[,.(id, P_default)] %>% as.data.frame
 
 write_csv(final.predictions, "6.csv")
+```
+
+
+
+```{r sandbox}
+data.raw %>% .[,lapply(.SD, anyNA)] %>% unlist %>% which %>% .[-1] -> select.cols
+noNA.data <- data.raw[,!select.cols, with = F] %>% .[data_source ==  "train"]
+
+library(rpart)
+fit.rpart <- rpart(factor(default) ~ ., noNA.data)
+fit.rpart$variable.importance %>% .[order(., decreasing = T)] %>% names-> imp.cols
+
+# final.cols <- imp.cols[-which(imp.cols %in% c("id", "emp_title", "zip_code", "earliest_cr_line", "desc"))]
+final.cols <- imp.cols[-which(imp.cols %in% c("id", "desc"))]
+
+train.data <- data.raw[data_source == "train",] %>% .[,default := factor(default, levels = c("0", "1"), labels = c("non_default", "default"))]
+train.data.subset <- train.data[sample(1:nrow(train.data), 5000), c("default", final.cols), with = F] # larger training sets kill my memory...
+
+ranger.grid <- expand.grid(mtry = 4, splitrule = "gini", min.node.size = 1)
+
+# create the caret experiment using the trainControl() function
+ctrl <- trainControl(
+  method = "cv", number = 5, # 10-fold CV
+  selectionFunction = "best", # select the best performer
+  classProbs = TRUE, # requested the predicted probs (for ROC)
+  summaryFunction = twoClassSummary, # needed to produce the ROC/AUC measures
+  savePredictions = TRUE # needed to plot the ROC curves
+)
+
+# train the decision tree model using 10-fold CV
+m.rpart <- train(factor(default) ~ .,
+                 data = train.data.subset,
+                 method = "ranger",
+                 metric = "ROC",
+                 trControl = ctrl,
+                 num.trees = 100, 
+                 tuneGrid = ranger.grid,
+                 verbose = T,
+                 importance = "impurity")
+
+m.rpart
+varImp(m.rpart)
+
 ```
 
