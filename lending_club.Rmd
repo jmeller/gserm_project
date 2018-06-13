@@ -70,21 +70,21 @@ data.cat.features %<>%
 fill.rates.num <- data.num.features[,lapply(.SD, 
                                function(col) sum(1 - as.integer(is.na(col)))/nrow(data.num.features)), 
                        .SDcols = names(data.num.features)] %>% unlist
-# remove cols with > 75% missing data
+## remove cols with > 75% missing data
 cols.wNAs.num <- fill.rates.num[which(fill.rates.num > 0.75)]
-data.wNAs.num <- data.num.features[, c("id", names(cols.wNAs)), with = F]
+data.wNAs.num <- data.num.features[, c("id", names(cols.wNAs.num)), with = F]
 
-# impute NAs by means
+## impute NAs by means
 impute.cols <- names(data.wNAs.num)[which(!names(data.wNAs.num) == "id")]
 data.wNAs.num <- data.wNAs.num[,paste0("dmi_", impute.cols) := # add dmis
                            lapply(.SD, function(col) ifelse(is.na(col), 1, 0)),
                          .SDcols = impute.cols]
-data.imputed <- data.wNAs.num[,(impute.cols) := 
+data.imputed.num <- data.wNAs.num[,(impute.cols) := 
                               lapply(.SD, function(col) 
                                 ifelse(is.na(col), mean(col, na.rm = T), col)), 
                             .SDcols = impute.cols]
 # merge back
-data.preprocessed <- merge(data.completeCols, data.imputed, by = "id")
+data.preprocessed <- merge(data.cat.features, data.imputed.num, by = "id")
 ```
 
 ```{r feature engineering}
@@ -156,6 +156,7 @@ library(caret)
 set.seed(2608)
 # train.data_set
 train.data.all <- train[, c("default", final.feat), with = F]
+train.idx <- sample(1:nrow(train.data.all), 350000)
 train.data.subset <- train.data.all[sample(1:nrow(train), 350000)] # larger training sets kill my memory...
 
 ranger.grid <- expand.grid(mtry = 4, splitrule = "gini", min.node.size = 1)
@@ -196,7 +197,11 @@ library(pROC)
 # save the predicted probabilities and actual values for decision tree
 predictions <- predict(m.ranger, train.data.subset, type = "prob")
 roc.ranger <- roc(predictor = predictions$default, response = train.data.subset$default)
-auc.ranger <- round(auc(roc.ranger), 3)
+
+
+table(predictions$default > 0.5, train.data.subset$default)
+auc.ranger <- round(auc(roc.ranger), 20)
+auc.ranger
 ```
 
 ```{r predict}
@@ -222,7 +227,7 @@ fit.rpart$variable.importance %>% .[order(., decreasing = T)] %>% names-> imp.co
 final.cols <- imp.cols[-which(imp.cols %in% c("id", "desc"))]
 
 train.data <- data.raw[data_source == "train",] %>% .[,default := factor(default, levels = c("0", "1"), labels = c("non_default", "default"))]
-train.data.subset <- train.data[sample(1:nrow(train.data), 5000), c("default", final.cols), with = F] # larger training sets kill my memory...
+train.data.subset <- train.data[sample(1:nrow(train.data), 25000), c("default", "loan_amnt", "term", "home_ownership", "annual_inc", "total_acc", "tot_cur_bal", "avg_cur_bal", "mort_acc", "tot_hi_cred_lim", "total_bal_ex_mort", "total_il_high_credit_limit"), with = F] # larger training sets kill my memory...
 
 ranger.grid <- expand.grid(mtry = 4, splitrule = "gini", min.node.size = 1)
 
