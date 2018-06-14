@@ -1,5 +1,5 @@
 ---
-title: 'First Draft Lending Club Model'
+title: 'Default Predictions for Lending Club'
 output:
   html_document:
     df_print: paged
@@ -38,8 +38,9 @@ table(data.raw$data_source)
 
 # clean/transform features
 data.raw %<>% .[,`:=`(title = factor(title),
-          zip_code = factor(zip_code),
+                      home_ownership = factor(home_ownership),
           revol_util = as.numeric(str_replace_all(revol_util, "[%]", "")),
+          term = factor(term),
           default = factor(default, 
                            levels = c("0","1"), 
                            labels = c("no_default", "default")))]
@@ -47,6 +48,7 @@ data.raw %<>% .[,`:=`(title = factor(title),
 # clean memory
 rm(train.raw, test.raw)
 ```
+
 # Missing value handling
 ```{r missing value handling}
 # divide data set into subsets w. numeric and categorical data
@@ -55,17 +57,15 @@ num.features <- which(col.classes %in% c("numeric", "integer"))
 cat.features <- c(1, which(col.classes %in% c("factor", "logical", "character")))
 data.num.features <- data.raw[,num.features, with = F]
 data.cat.features <- data.raw[,cat.features, with = F]
+# exclude cols with less than 2 categories
+cat.levels <- data.cat.features[,lapply(.SD, function(col) length(unique(col)))] %>% unlist
+excl.cats <- which(cat.levels < 2)
+data.cat.features %<>% .[,!excl.cats, with = F] %>% .[,!"default", with = F]
 
 # cat features: replace NA w. "Missing"
-fill.rates.cat <- data.cat.features[,lapply(.SD, 
-                               function(col) sum(1 - as.integer(is.na(col)))/nrow(data.cat.features)), 
-                       .SDcols = names(data.cat.features)] %>% unlist
-## remove cols w.o. any data
-exclude.cat <- fill.rates.cat[which(fill.rates.cat == 0)] 
-data.cat.features %<>% .[,!names(exclude.cat), with = F]
 data.cat.features %<>% 
-  .[,lapply(.SD, function(col) ifelse(is.na(col), "Missing", col)), 
-    .SDcols = c(1,3:ncol(.))]
+  .[,lapply(.SD, function(col) ifelse(is.na(col), "Missing", as.character(col)))] %>%
+  .[,id := as.numeric(id)]
 
 # numeric features
 fill.rates.num <- data.num.features[,lapply(.SD, 
@@ -84,14 +84,19 @@ data.imputed.num <- data.wNAs.num[,(impute.cols) :=
                               lapply(.SD, function(col) 
                                 ifelse(is.na(col), mean(col, na.rm = T), col)), 
                             .SDcols = impute.cols]
+## scale cols - only "truly" numeric ones
+scale.cols <- names(data.imputed.num) %>% .[-which(str_detect(., "id|dmi_"))]
+data.imputed.num %<>% .[,(scale.cols) := lapply(.SD, scale), .SDcols = scale.cols]
+
 # merge back
 target <- data.raw[,.(id, default)]
-data.preprocessed <- merge(data.cat.features, data.imputed.num, by = "id") %>% merge(target, by = "id")
+data.preprocessed <- merge(data.cat.features, data.imputed.num, by = "id") %>% 
+  merge(target, by = "id")
 ```
-
+# Feature engineering
 ```{r feature engineering}
 # feature engineering
-data.preprocessed[,`:=`(emp_title = as.factor(ifelse(str_detect(tolower(emp_title), "manager|director|ceo"),
+data.preprocessed %<>% .[,`:=`(emp_title = as.factor(ifelse(str_detect(tolower(emp_title), "manager|director|ceo"),
                                                  "executive",
                                                  ifelse(str_detect(tolower(emp_title), "engineer|specialist"),
                                                         "specialist",
@@ -102,44 +107,92 @@ data.preprocessed[,`:=`(emp_title = as.factor(ifelse(str_detect(tolower(emp_titl
                         earliest_cr_line_month = as.factor(str_sub(earliest_cr_line, 1,3)),
                         earliest_cr_line_year = str_sub(earliest_cr_line, 5,8),
                         earliest_cr_line = NULL,
-                        zip_2 = as.factor(str_sub(zip_code, 1, 3)))] %>%
+                        zip_2 = as.factor(str_sub(zip_code, 1, 2)))] %>%
   .[,`:=`(length_bs_rel = (2018 - as.integer(earliest_cr_line_year)),
-          earliest_cr_line_year = as.factor(earliest_cr_line_year))]
+          earliest_cr_line_year = as.factor(earliest_cr_line_year),
+          zip_code = NULL, term = as.factor(term),
+          emp_length = as.factor(emp_length),
+          home_ownership = as.factor(home_ownership),
+          desc = NULL,
+          purpose = as.factor(purpose),
+          title = as.factor(title),
+          addr_state = as.factor(addr_state),
+          initial_list_status = as.factor(initial_list_status),
+          application_type = as.factor(application_type),
+          verification_status_joint = as.factor(verification_status_joint))]
 ```
 
+# Explorative data analysis (EDA)
+
+```{r EDA}
+train <- data.preprocessed
+library(visdat)
+
+# explore data
+summary(train) # explore data using standard summary function
+vis_dat(train[1,], sort_type = T) # explore distribution of data types
+sum(unlist(lapply(train, function(x) is.numeric(x))))/ncol(train) # compute share of numeric variables
+
+# detect outliers
+tukey_outliers <- function (x) {
+
+  Q1 <- quantile(x, 1/4, na.rm = TRUE)
+  Q3 <- quantile(x, 3/4, na.rm = TRUE)
+  IQR <- Q3 - Q1
+
+  # note: need to exclude NA values
+  outliers <- unique(x[!is.na(x) & (x < Q1 - 1.5 * IQR | x > Q3 + 1.5 * IQR)])
+  return(outliers)
+}
+
+# count number of outliers per numeric variable and store as numeric_outliers
+numeric_vars <- unname(unlist(lapply(train, function(x) is.numeric(x))))
+numeric_outliers <- lapply(train[,which(numeric_vars), with = F], function(x) tukey_outliers(x))
+summary(numeric_outliers)
+
+# store names of outliers
+df <- which(lapply(numeric_outliers, length) > 10000)
+names(df)
+
+# visually inspect "fico_range_low" w/ boxplot
+boxplot(train[,c("fico_range_low")], main = "Fico Range Low")
+
+# select only those outliers
+selected_numeric_vars <- train[,names(df), with = F]
+summary(selected_numeric_vars)
+
+# create new binary outlier columns
+train$revol_bal_outlier <- selected_numeric_vars$revol_bal %in% tukey_outliers(selected_numeric_vars$revol_bal)
+train$tot_cur_bal_outlier <- selected_numeric_vars$tot_cur_bal %in% tukey_outliers(selected_numeric_vars$tot_cur_bal)
+train$avg_cur_bal_outlier <- selected_numeric_vars$avg_cur_bal %in% tukey_outliers(selected_numeric_vars$avg_cur_bal)
+train$bc_open_to_buy_outlier <- selected_numeric_vars$bc_open_to_buy %in% tukey_outliers(selected_numeric_vars$bc_open_to_buy)
+train$tot_hi_cred_lim_outlier <- selected_numeric_vars$tot_hi_cred_lim %in% tukey_outliers(selected_numeric_vars$tot_hi_cred_lim)
+train$total_bal_ex_mort_outlier <- selected_numeric_vars$total_bal_ex_mort %in% tukey_outliers(selected_numeric_vars$total_bal_ex_mort)
+train$total_il_high_credit_limit_outlier <- selected_numeric_vars$total_il_high_credit_limit %in% tukey_outliers(selected_numeric_vars$total_il_high_credit_limit)
+
+```
 
 
 # Feature selection
 ```{r feature_selection}
-# data.preprocessed <- data.raw
-# manually exclude taboo features
-data.preprocessed %<>% .[,!taboo.list, with = F] %>% .[order(id)]
-
-train <- data.preprocessed[data_source == "train"] %>% .[,!which(names(.) %in% 
-                                                                   c("id", "data_source")), 
+train <- data.preprocessed[data_source == "train"] %>% .[,!which(names(.) %in%
+                                                                   c("id", "data_source")),
                                                          with = F]
-
-set.seed(2608)
-# subset.train <- train[sample(1:nrow(train), 10000),
-#                     which(names(train) %in% c("default", feat.manual)), with = F]
-# feature importance based on downsampled training data
-# downSample(train, train$default) %>% select(-Class) -> train.downsample
-# subset.train <- train[sample(1:nrow(train), 20000), ]
-
+# train <- train[data_source == "train"] %>% .[,!which(names(.) %in% 
+#                                                                    c("id", "data_source")), 
+#                                                          with = F]
 fit <- ranger(default ~ ., train, importance = "impurity", num.trees = 20)
 importance.feat <- importance(fit) %>% .[order(., decreasing = T)]
 importance.feat
 
-top30.feat <- names(importance.feat)[1:30]
-top30.feat
+top20.feat <- names(importance.feat)[1:20]
+top20.feat
 
 # manual.feat <- c("acc_now_delinq", "delinq_amnt", "fico_range_low", 
 #                  "num_tl_30dpd", "pct_tl_nvr_dlq", "revol_util")
 # 
 # final.feat <- union(top10.feat, manual.feat)
-final.feat <- top30.feat
-# clean up memory
-rm(train.downsample)
+final.feat <- top20.feat
 ```
 # Model tuning and evaluation
 ```{r evaluation}
@@ -151,13 +204,13 @@ train <- data.preprocessed[data_source == "train"] %>% .[,!which(names(.) %in%
                                                                    c("id", "data_source")), 
                                                          with = F] 
 train.data.all <- train[, c("default", final.feat), with = F]
-train.data.subset <- train.data.all[sample(1:nrow(train), 10000)] # larger training sets kill my memory...
+train.data.subset <- train.data.all[sample(1:nrow(train), 25000)] # larger training sets kill my memory...
 
-ranger.grid <- expand.grid(mtry = c(4,5,6), splitrule = "gini", min.node.size = 1)
+ranger.grid <- expand.grid(mtry = c(4,5), splitrule = "gini", min.node.size = 1)
 
 # create the caret experiment using the trainControl() function
 ctrl <- trainControl(
-  method = "cv", number = 10, # 10-fold CV
+  method = "cv", number = 5, # 5-fold CV
   selectionFunction = "best", # select the best performer
   classProbs = TRUE, # requested the predicted probs (for ROC)
   summaryFunction = twoClassSummary, # needed to produce the ROC/AUC measures
@@ -166,12 +219,12 @@ ctrl <- trainControl(
 
 # train the decision tree model using 10-fold CV
 m.ranger <- train(default ~ .,
-                 data = train.data.subset,
+                 data = train.data.all,
                  method = "ranger",
                  metric = "ROC",
                  trControl = ctrl, 
                  tuneGrid = ranger.grid, verbose = T,
-                 num.trees = 500)
+                 num.trees = 50) # 500
 
 m.ranger
 
@@ -188,7 +241,61 @@ m.xgboost <- train(default ~.,
                    trControl = ctrl, verbose = T)
 
 m.xgboost
+
+# # train svm model
+# svm.grid <- expand.grid(C = c(0.01, 0.1, 1))
+# m.svm <- train(default ~.,
+#                    data = train.data.subset,
+#                    method = "svmLinear",
+#                    metric = "ROC",
+#                    tuneGrid = svm.grid,
+#                    trControl = ctrl, verbose = T)
+# 
+# m.svm
 ```
+```{r train final model}
+library(xgboost)
+library(forcats)
+library(dummies)
+ # X_train <- train.data.all %>%
+ #    dplyr::select(-default, -last_credit_pull_d_month, -last_credit_pull_d_year, -term, -zip_2, -zip_code) %>% 
+ #    as.matrix()
+  X_train <- train.data.all %>%
+    dplyr::select(-default) %>% dummy.data.frame(verbose = T, drop = F) %>%
+    as.matrix()
+  y_train <- train.data.all$default %>% recode(no_default = 0, default = 1)
+    
+  # XGB ---------------------------------------------------------------------
+  param <- list("objective" = "binary:logistic", #binary:logistic
+                "eval_metric" = "auc",
+                "eta" = 0.01,
+                "max_depth" = 7)
+  
+  cv.nfold <- 5
+  dtrain <- xgb.DMatrix(X_train, label = y_train)
+  
+ m.xgb <- xgb.cv(param = param,
+                data = X_train,
+                label = y_train,
+                nfold = cv.nfold,
+                nrounds = 100)
+
+ # best nrounds param:
+ xgb.final <- xgboost(param = param,
+                  data = X_train,
+                  label = y_train,
+                  nrounds = 100,
+                  verbose = 1)
+
+ 
+ 
+
+
+```
+
+
+
+
 ```{r roc}
 library(pROC)
 
@@ -205,10 +312,17 @@ auc.ranger
 ```{r predict}
 test <- data.preprocessed[data_source == "test"] %>% .[,!which(names(.) == "data_source"), with = F]
 test$P_default <- predict(m.ranger, test, type = "prob")$default
-
 final.predictions <- test[,.(id, P_default)] %>% as.data.frame
-
 write_csv(final.predictions, "6.csv")
+
+# for xgb
+X_test <- test %>%
+  .[,top20.feat, with = F] %>% dummy.data.frame(verbose = T, drop = F) %>%
+    as.matrix()
+test.xgb <- test
+test.xgb$P_default <- predict(xgb.final, X_test, type= "prob")
+final.predictions.xgb <- test.xgb[,.(id, P_default)] %>% as.data.frame
+write_csv(final.predictions.xgb, "6_xgb_experimental.csv")
 ```
 
 
