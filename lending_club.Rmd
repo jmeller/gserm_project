@@ -1,9 +1,12 @@
 ---
-title: 'Default Predictions for Lending Club'
+title: 'Project Report: Default Predictions for Lending Club'
+author: Jochen Hartmann and Jan Meller
 output:
   html_document:
     df_print: paged
 ---
+
+# Problem overview
 
 # Data loading
 ```{r data_loading, results = "hide"}
@@ -17,24 +20,20 @@ library(tidyverse)
 
 # features not to use
 # taboo.list <- c("last_fico_range_high", "last_fico_range_low", "acc_now_delinq")
-taboo.list <- c("")
 
 train.raw <- fread("lending_club_train.csv", stringsAsFactors = T)
 test.raw <- fread("lending_club_test.csv", stringsAsFactors = T)
 ```
 
-# Data preprocessing
-```{r data_preprocessing}
+# Data cleaning
+```{r data_cleaning}
 # combine train and test data for data handling
 data.raw <- union(
   # the mutate function adds a source so we can split it again later
   train.raw[, data_source := "train"],
   test.raw[, `:=`(data_source = "test",
                   default = as.integer(default))]
-) 
-
-# confirm that the union worked correctly
-table(data.raw$data_source)
+)
 
 # clean/transform features
 data.raw %<>% .[,`:=`(title = factor(title),
@@ -47,6 +46,58 @@ data.raw %<>% .[,`:=`(title = factor(title),
 
 # clean memory
 rm(train.raw, test.raw)
+```
+
+# Explorative data analysis (EDA)
+```{r EDA 1}
+summary(data.raw) # explore data using standard summary function
+```
+
+```{r EDA 1}
+library(visdat)
+
+# explore data
+vis_dat(data.raw[1,], sort_type = T) # explore distribution of data types
+sum(unlist(lapply(data.raw, function(x) is.numeric(x))))/ncol(data.raw) # compute share of numeric variables
+
+# detect outliers
+tukey_outliers <- function (x) {
+
+  Q1 <- quantile(x, 1/4, na.rm = TRUE)
+  Q3 <- quantile(x, 3/4, na.rm = TRUE)
+  IQR <- Q3 - Q1
+
+  # note: need to exclude NA values
+  outliers <- unique(x[!is.na(x) & (x < Q1 - 1.5 * IQR | x > Q3 + 1.5 * IQR)])
+  return(outliers)
+}
+
+# count number of outliers per numeric variable and store as numeric_outliers
+numeric_vars <- unname(unlist(lapply(data.raw, function(x) is.numeric(x))))
+numeric_outliers <- lapply(data.raw[,which(numeric_vars), with = F], function(x) tukey_outliers(x))
+summary(numeric_outliers)
+
+# store names of outliers
+df <- which(lapply(numeric_outliers, length) > 10000)
+names(df)
+
+# visually inspect "fico_range_low" w/ boxplot
+boxplot(data.raw[,c("fico_range_low")], main = "Fico Range Low")
+
+# select only those outliers
+selected_numeric_vars <- data.raw[,names(df), with = F]
+summary(selected_numeric_vars)
+
+# create new binary outlier columns
+data.outliers <- data.raw[,.(id, revol_bal, tot_cur_bal, avg_cur_bal, bc_open_to_buy, tot_hi_cred_lim, total_bal_ex_mort, total_il_high_credit_limit)]
+data.outliers$revol_bal_outlier <- selected_numeric_vars$revol_bal %in% tukey_outliers(selected_numeric_vars$revol_bal)
+data.outliers$tot_cur_bal_outlier <- selected_numeric_vars$tot_cur_bal %in% tukey_outliers(selected_numeric_vars$tot_cur_bal)
+data.outliers$avg_cur_bal_outlier <- selected_numeric_vars$avg_cur_bal %in% tukey_outliers(selected_numeric_vars$avg_cur_bal)
+data.outliers$bc_open_to_buy_outlier <- selected_numeric_vars$bc_open_to_buy %in% tukey_outliers(selected_numeric_vars$bc_open_to_buy)
+data.outliers$tot_hi_cred_lim_outlier <- selected_numeric_vars$tot_hi_cred_lim %in% tukey_outliers(selected_numeric_vars$tot_hi_cred_lim)
+data.outliers$total_bal_ex_mort_outlier <- selected_numeric_vars$total_bal_ex_mort %in% tukey_outliers(selected_numeric_vars$total_bal_ex_mort)
+data.outliers$total_il_high_credit_limit_outlier <- selected_numeric_vars$total_il_high_credit_limit %in% tukey_outliers(selected_numeric_vars$total_il_high_credit_limit)
+data.outliers %<>% .[,!c("revol_bal", "tot_cur_bal", "avg_cur_bal", "bc_open_to_buy", "tot_hi_cred_lim", "total_bal_ex_mort", "total_il_high_credit_limit")]
 ```
 
 # Missing value handling
@@ -91,7 +142,7 @@ data.imputed.num %<>% .[,(scale.cols) := lapply(.SD, scale), .SDcols = scale.col
 # merge back
 target <- data.raw[,.(id, default)]
 data.preprocessed <- merge(data.cat.features, data.imputed.num, by = "id") %>% 
-  merge(target, by = "id")
+  merge(target, by = "id") %>% merge(data.outliers, by = "id")
 ```
 # Feature engineering
 ```{r feature engineering}
@@ -122,57 +173,6 @@ data.preprocessed %<>% .[,`:=`(emp_title = as.factor(ifelse(str_detect(tolower(e
           verification_status_joint = as.factor(verification_status_joint))]
 ```
 
-# Explorative data analysis (EDA)
-
-```{r EDA}
-train <- data.preprocessed
-library(visdat)
-
-# explore data
-summary(train) # explore data using standard summary function
-vis_dat(train[1,], sort_type = T) # explore distribution of data types
-sum(unlist(lapply(train, function(x) is.numeric(x))))/ncol(train) # compute share of numeric variables
-
-# detect outliers
-tukey_outliers <- function (x) {
-
-  Q1 <- quantile(x, 1/4, na.rm = TRUE)
-  Q3 <- quantile(x, 3/4, na.rm = TRUE)
-  IQR <- Q3 - Q1
-
-  # note: need to exclude NA values
-  outliers <- unique(x[!is.na(x) & (x < Q1 - 1.5 * IQR | x > Q3 + 1.5 * IQR)])
-  return(outliers)
-}
-
-# count number of outliers per numeric variable and store as numeric_outliers
-numeric_vars <- unname(unlist(lapply(train, function(x) is.numeric(x))))
-numeric_outliers <- lapply(train[,which(numeric_vars), with = F], function(x) tukey_outliers(x))
-summary(numeric_outliers)
-
-# store names of outliers
-df <- which(lapply(numeric_outliers, length) > 10000)
-names(df)
-
-# visually inspect "fico_range_low" w/ boxplot
-boxplot(train[,c("fico_range_low")], main = "Fico Range Low")
-
-# select only those outliers
-selected_numeric_vars <- train[,names(df), with = F]
-summary(selected_numeric_vars)
-
-# create new binary outlier columns
-train$revol_bal_outlier <- selected_numeric_vars$revol_bal %in% tukey_outliers(selected_numeric_vars$revol_bal)
-train$tot_cur_bal_outlier <- selected_numeric_vars$tot_cur_bal %in% tukey_outliers(selected_numeric_vars$tot_cur_bal)
-train$avg_cur_bal_outlier <- selected_numeric_vars$avg_cur_bal %in% tukey_outliers(selected_numeric_vars$avg_cur_bal)
-train$bc_open_to_buy_outlier <- selected_numeric_vars$bc_open_to_buy %in% tukey_outliers(selected_numeric_vars$bc_open_to_buy)
-train$tot_hi_cred_lim_outlier <- selected_numeric_vars$tot_hi_cred_lim %in% tukey_outliers(selected_numeric_vars$tot_hi_cred_lim)
-train$total_bal_ex_mort_outlier <- selected_numeric_vars$total_bal_ex_mort %in% tukey_outliers(selected_numeric_vars$total_bal_ex_mort)
-train$total_il_high_credit_limit_outlier <- selected_numeric_vars$total_il_high_credit_limit %in% tukey_outliers(selected_numeric_vars$total_il_high_credit_limit)
-
-```
-
-
 # Feature selection
 ```{r feature_selection}
 train <- data.preprocessed[data_source == "train"] %>% .[,!which(names(.) %in%
@@ -196,228 +196,122 @@ final.feat <- top20.feat
 ```
 # Model tuning and evaluation
 ```{r evaluation}
-
 library(caret)
 set.seed(2608)
+
 # train.data_set
 train <- data.preprocessed[data_source == "train"] %>% .[,!which(names(.) %in% 
                                                                    c("id", "data_source")), 
                                                          with = F] 
 train.data.all <- train[, c("default", final.feat), with = F]
-train.data.subset <- train.data.all[sample(1:nrow(train), 25000)] # larger training sets kill my memory...
-
-ranger.grid <- expand.grid(mtry = c(4,5), splitrule = "gini", min.node.size = 1)
+train.data.subset <- train.data.all[sample(1:nrow(train), 5000)]
 
 # create the caret experiment using the trainControl() function
 ctrl <- trainControl(
-  method = "cv", number = 5, # 5-fold CV
+  method = "cv", number = 10, # 10-fold CV
   selectionFunction = "best", # select the best performer
   classProbs = TRUE, # requested the predicted probs (for ROC)
   summaryFunction = twoClassSummary, # needed to produce the ROC/AUC measures
   savePredictions = TRUE # needed to plot the ROC curves
 )
 
-# train the decision tree model using 10-fold CV
-m.ranger <- train(default ~ .,
-                 data = train.data.all,
-                 method = "ranger",
-                 metric = "ROC",
-                 trControl = ctrl, 
-                 tuneGrid = ranger.grid, verbose = T,
-                 num.trees = 50) # 500
+# random forest model
+if(!file.exists("m.ranger.rds")) {
+  
+  ranger.grid <- expand.grid(mtry = c(4,5), splitrule = "gini", min.node.size = 1)
+  # train actual model
+  m.ranger <- train(default ~ .,
+                    data = train.data.all,
+                    method = "ranger",
+                    metric = "ROC",
+                    trControl = ctrl, 
+                    tuneGrid = ranger.grid, verbose = T,
+                    num.trees = 100) # 500
+  
+  m.ranger
+  saveRDS(m.ranger, "m.ranger.rds")
+} else {
+  m.ranger <- readRDS("m.ranger.rds")
+} 
 
-m.ranger
-
-# train xgb model
-xgb.grid <- expand.grid(nrounds = c(100), 
-                        max_depth = c(6), eta = 0.3, 
-                        subsample = 1, colsample_bytree = 1, 
-                        gamma = 0, min_child_weight = 1)
-m.xgboost <- train(default ~.,
-                   data = train.data.subset,
-                   method = "xgbTree",
-                   metric = "ROC",
-                   tuneGrid = xgb.grid,
-                   trControl = ctrl, verbose = T)
-
-m.xgboost
-
-# # train svm model
-# svm.grid <- expand.grid(C = c(0.01, 0.1, 1))
-# m.svm <- train(default ~.,
-#                    data = train.data.subset,
-#                    method = "svmLinear",
-#                    metric = "ROC",
-#                    tuneGrid = svm.grid,
-#                    trControl = ctrl, verbose = T)
+# boosted tree model
+if(!file.exists("m.xgboost.rds")) {
+  xgb.grid <- expand.grid(nrounds = c(50, 100, 150), 
+                          max_depth = 6, eta = 0.3, 
+                          subsample = 1, colsample_bytree = 1, 
+                          gamma = 0, min_child_weight = 1)
+  # train actual model
+  m.xgboost <- train(default ~.,
+                     data = train.data.all,
+                     method = "xgbTree",
+                     metric = "ROC",
+                     tuneGrid = xgb.grid,
+                     trControl = ctrl, verbose = T)
+  
+  m.xgboost
+  saveRDS(m.xgboost, "m.xgboost.rds")
+  
+} else {
+  m.xgboost <- readRDS("m.xgboost.rds")
+}
+# # legacy code: directly learn xgboost model
+# library(xgboost)
+# library(forcats)
+# library(dummies)
+#   X_train <- train.data.all %>%
+#     dplyr::select(-default) %>% dummy.data.frame(verbose = T, drop = F) %>%
+#     as.matrix()
+#   y_train <- train.data.all$default %>% recode(no_default = 0, default = 1)
+#     
+#   # XGB ---------------------------------------------------------------------
+#   param <- list("objective" = "binary:logistic", #binary:logistic
+#                 "eval_metric" = "auc",
+#                 "eta" = 0.01,
+#                 "max_depth" = 7)
+#   
+#   cv.nfold <- 5
+#   
+#  m.xgb <- xgb.cv(param = param,
+#                 data = X_train,
+#                 label = y_train,
+#                 nfold = cv.nfold,
+#                 nrounds = 100)
 # 
-# m.svm
-```
-```{r train final model}
-library(xgboost)
-library(forcats)
-library(dummies)
- # X_train <- train.data.all %>%
- #    dplyr::select(-default, -last_credit_pull_d_month, -last_credit_pull_d_year, -term, -zip_2, -zip_code) %>% 
- #    as.matrix()
-  X_train <- train.data.all %>%
-    dplyr::select(-default) %>% dummy.data.frame(verbose = T, drop = F) %>%
-    as.matrix()
-  y_train <- train.data.all$default %>% recode(no_default = 0, default = 1)
-    
-  # XGB ---------------------------------------------------------------------
-  param <- list("objective" = "binary:logistic", #binary:logistic
-                "eval_metric" = "auc",
-                "eta" = 0.01,
-                "max_depth" = 7)
-  
-  cv.nfold <- 5
-  dtrain <- xgb.DMatrix(X_train, label = y_train)
-  
- m.xgb <- xgb.cv(param = param,
-                data = X_train,
-                label = y_train,
-                nfold = cv.nfold,
-                nrounds = 100)
-
- # best nrounds param:
- xgb.final <- xgboost(param = param,
-                  data = X_train,
-                  label = y_train,
-                  nrounds = 100,
-                  verbose = 1)
-
- 
- 
-
-
+#  # best nrounds param:
+#  xgb.final <- xgboost(param = param,
+#                   data = X_train,
+#                   label = y_train,
+#                   nrounds = 100,
+#                   verbose = 1)
 ```
 
+# Performance evaluation
+```{r performance evaluation}
+# collect resamples
+results <- resamples(list(XGB=m.xgboost, RF=m.ranger))
 
+# summarize the distributions
+summary(results)
 
+# boxplots of results
+bwplot(results)
 
-```{r roc}
-library(pROC)
-
-# save the predicted probabilities and actual values for decision tree
-predictions <- predict(m.ranger, train.data.subset, type = "prob")
-roc.ranger <- roc(predictor = predictions$default, response = train.data.subset$default)
-
-
-table(predictions$default > 0.5, train.data.subset$default)
-auc.ranger <- round(auc(roc.ranger), 20)
-auc.ranger
+# dot plots of results
+dotplot(results)
 ```
 
-```{r predict}
+```{r make final predictions}
 test <- data.preprocessed[data_source == "test"] %>% .[,!which(names(.) == "data_source"), with = F]
 test$P_default <- predict(m.ranger, test, type = "prob")$default
 final.predictions <- test[,.(id, P_default)] %>% as.data.frame
 write_csv(final.predictions, "6.csv")
 
-# for xgb
-X_test <- test %>%
-  .[,top20.feat, with = F] %>% dummy.data.frame(verbose = T, drop = F) %>%
-    as.matrix()
-test.xgb <- test
-test.xgb$P_default <- predict(xgb.final, X_test, type= "prob")
-final.predictions.xgb <- test.xgb[,.(id, P_default)] %>% as.data.frame
-write_csv(final.predictions.xgb, "6_xgb_experimental.csv")
+# # for xgb
+# X_test <- test %>%
+#   .[,top20.feat, with = F] %>% dummy.data.frame(verbose = T, drop = F) %>%
+#     as.matrix()
+# test.xgb <- test
+# test.xgb$P_default <- predict(xgb.final, X_test, type= "prob")
+# final.predictions.xgb <- test.xgb[,.(id, P_default)] %>% as.data.frame
+# write_csv(final.predictions.xgb, "6_xgb_experimental.csv")
 ```
-
-
-
-```{r sandbox}
-
-train.data <- data.raw %>% filter(data_source == "train") %>%
-  select(c("default", "loan_amnt", "term", "home_ownership", "annual_inc", 
-           "total_acc", "tot_cur_bal", "avg_cur_bal", "mort_acc", 
-           "tot_hi_cred_lim", "total_bal_ex_mort", "total_il_high_credit_limit")) %>%
-  mutate(default = factor(default, levels = c("0", "1"), labels = c("non_default", "default")),
-         loan_amnt = as.numeric(loan_amnt),
-         term = as.factor(term), 
-         home_ownership = as.factor(home_ownership),
-         annual_inc = as.numeric(annual_inc),
-         total_acc = as.numeric(total_acc),
-         tot_cur_bal = as.numeric(tot_cur_bal),
-         avg_cur_bal = as.numeric(avg_cur_bal),
-         mort_acc = as.factor(mort_acc),
-         tot_hi_cred_lim = as.numeric(tot_hi_cred_lim),
-         total_bal_ex_mort = as.numeric(total_bal_ex_mort),
-         total_il_high_credit_limit = as.numeric(total_il_high_credit_limit))
-
-
-
-
-
-
-
-
-data.raw %>% .[,lapply(.SD, anyNA)] %>% unlist %>% which %>% .[-1] -> select.cols
-noNA.data <- data.raw[,!select.cols, with = F] %>% .[data_source ==  "train"]
-
-library(rpart)
-fit.rpart <- rpart(factor(default) ~ ., noNA.data)
-fit.rpart$variable.importance %>% .[order(., decreasing = T)] %>% names-> imp.cols
-
-# final.cols <- imp.cols[-which(imp.cols %in% c("id", "emp_title", "zip_code", "earliest_cr_line", "desc"))]
-final.cols <- imp.cols[-which(imp.cols %in% c("id", "desc"))]
-
-train.data <- data.raw[data_source == "train",] %>% .[,default := factor(default, levels = c("0", "1"), labels = c("non_default", "default"))]
-train.data.subset <- train.data[sample(1:nrow(train.data), 25000), c("default", "loan_amnt", "term", "home_ownership", "annual_inc", "total_acc", "tot_cur_bal", "avg_cur_bal", "mort_acc", "tot_hi_cred_lim", "total_bal_ex_mort", "total_il_high_credit_limit"), with = F] # larger training sets kill my memory...
-
-ranger.grid <- expand.grid(mtry = 4, splitrule = "gini", min.node.size = 1)
-
-# create the caret experiment using the trainControl() function
-ctrl <- trainControl(
-  method = "cv", number = 5, # 10-fold CV
-  selectionFunction = "best", # select the best performer
-  classProbs = TRUE, # requested the predicted probs (for ROC)
-  summaryFunction = twoClassSummary, # needed to produce the ROC/AUC measures
-  savePredictions = TRUE # needed to plot the ROC curves
-)
-
-# train the decision tree model using 10-fold CV
-m.rpart <- train(factor(default) ~ .,
-                 data = train.data.subset,
-                 method = "ranger",
-                 metric = "ROC",
-                 trControl = ctrl,
-                 num.trees = 100, 
-                 tuneGrid = ranger.grid,
-                 verbose = T,
-                 importance = "impurity")
-
-m.rpart
-varImp(m.rpart)
-
-
-train.raw %<>% mutate(default = factor(default, levels = c("0", "1"), labels = c("non_default", "default")))
-train.data.set <- train.raw %>% select(c("default", "loan_amnt", "term", "home_ownership", "annual_inc", "total_acc", "tot_cur_bal", "avg_cur_bal", "mort_acc", "tot_hi_cred_lim", "total_bal_ex_mort", "total_il_high_credit_limit"))
-set.seed(123)
-train.data.set <- train.data[sample(1:nrow(train.data), 5000),]
-
-ranger.grid <- expand.grid(mtry = 4)
-
-# create the caret experiment using the trainControl() function
-ctrl <- trainControl(
-  method = "cv", number = 5, # 10-fold CV
-  selectionFunction = "best", # select the best performer
-  classProbs = TRUE, # requested the predicted probs (for ROC)
-  summaryFunction = twoClassSummary, # needed to produce the ROC/AUC measures
-  savePredictions = TRUE # needed to plot the ROC curves
-)
-
-# train the decision tree model using 10-fold CV
-m.ranger <- train(default ~ .,
-                 data = train.data.set,
-                 method = "rf",
-                 metric = "ROC",
-                 trControl = ctrl,
-                 tuneGrid = ranger.grid,
-                 verbose = T)
-
-m.ranger
-varImp(m.ranger)
-```
-
