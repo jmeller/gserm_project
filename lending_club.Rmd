@@ -1,7 +1,8 @@
 ---
 title: 'Project Report: Default Predictions for Lending Club'
-author: Jochen Hartmann and Jan Meller
+author: "Jochen Hartmann and Jan Meller"
 output:
+  pdf_document: default
   html_document:
     df_print: paged
 ---
@@ -53,7 +54,7 @@ rm(train.raw, test.raw)
 summary(data.raw) # explore data using standard summary function
 ```
 
-```{r EDA 1}
+```{r EDA 2}
 library(visdat)
 
 # explore data
@@ -178,10 +179,14 @@ data.preprocessed %<>% .[,`:=`(emp_title = as.factor(ifelse(str_detect(tolower(e
 train <- data.preprocessed[data_source == "train"] %>% .[,!which(names(.) %in%
                                                                    c("id", "data_source")),
                                                          with = F]
-# train <- train[data_source == "train"] %>% .[,!which(names(.) %in% 
-#                                                                    c("id", "data_source")), 
-#                                                          with = F]
-fit <- ranger(default ~ ., train, importance = "impurity", num.trees = 20)
+# random forest model
+if(!file.exists("feat.selection.rds")) {
+  fit <- ranger(default ~ ., train, importance = "impurity", num.trees = 20)
+  saveRDS(fit, "feat.selection.rds")
+} else {
+  fit <- readRDS("feat.selection.rds")
+} 
+
 importance.feat <- importance(fit) %>% .[order(., decreasing = T)]
 importance.feat
 
