@@ -1,39 +1,45 @@
 ---
-title: 'Project Report: Default Predictions for Lending Club'
+title: "Advanced Machine Learning with R - Project Report"
 author: "Jochen Hartmann and Jan Meller"
+subtitle: Default Predictions for the Lending Club Data Set
 output:
-  pdf_document: default
-  html_document:
-    df_print: paged
+  html_notebook: default
 ---
+```{r load packages, message=FALSE, warning=FALSE, include=FALSE}
+suppressMessages(library(data.table))
+suppressMessages(library(randomForest))
+suppressMessages(library(ranger))
+suppressMessages(library(magrittr))
+suppressMessages(library(caret))
+suppressMessages(library(dplyr))
+suppressMessages(library(tidyverse))
+suppressMessages(library(visdat))
+suppressMessages(library(caret))
+```
 
 # Problem overview
+Some introductory sentences on the lending club data set and goal of project...
 
 # Data loading
 ```{r data_loading, results = "hide"}
-library(data.table)
-library(randomForest)
-library(ranger)
-library(magrittr)
-library(caret)
-library(dplyr)
-library(tidyverse)
-
-# features not to use
-# taboo.list <- c("last_fico_range_high", "last_fico_range_low", "acc_now_delinq")
-
-train.raw <- fread("lending_club_train.csv", stringsAsFactors = T)
-test.raw <- fread("lending_club_test.csv", stringsAsFactors = T)
+train.raw <- suppressWarnings(fread("lending_club_train.csv", stringsAsFactors = T))
+test.raw <- suppressWarnings(fread("lending_club_test.csv", stringsAsFactors = T))
 ```
+We received two data sets: 
+
+- the train data set including the classification target, *default*, with `r nrow(train.raw)` rows and `r ncol(train.raw)` columns
+- the test data set with `r nrow(test.raw)` rows for which the final predictions had to be submitted.
 
 # Data cleaning
-```{r data_cleaning}
+
+In a first step, we combine both data sets to be able to perform subsequent preprocessing operations. Also, at this stage we apply first very basic data cleaning procedures.
+```{r data_cleaning, message=FALSE, warning=FALSE}
 # combine train and test data for data handling
 data.raw <- union(
-  # the mutate function adds a source so we can split it again later
+  # we add the data source so we can split it again later
   train.raw[, data_source := "train"],
   test.raw[, `:=`(data_source = "test",
-                  default = as.integer(default))]
+                  default = as.integer(default))] # casting to integer is necessary to combine both data sets
 )
 
 # clean/transform features
@@ -45,20 +51,19 @@ data.raw %<>% .[,`:=`(title = factor(title),
                            levels = c("0","1"), 
                            labels = c("no_default", "default")))]
 
-# clean memory
-rm(train.raw, test.raw)
+# visualize subset of the data.raw table
+head(data.raw[,2:8, with = F], 5)
 ```
 
-# Explorative data analysis (EDA)
+# Explorative data analysis
+Some explorative analyses...
+
 ```{r EDA 1}
-summary(data.raw) # explore data using standard summary function
+summary(data.raw[,2:8, with = F]) # explore data using standard summary function
+data.raw[1,] %>% vis_dat(sort_type = T) # explore distribution of data types
 ```
 
 ```{r EDA 2}
-library(visdat)
-
-# explore data
-vis_dat(data.raw[1,], sort_type = T) # explore distribution of data types
 sum(unlist(lapply(data.raw, function(x) is.numeric(x))))/ncol(data.raw) # compute share of numeric variables
 
 # detect outliers
@@ -76,14 +81,13 @@ tukey_outliers <- function (x) {
 # count number of outliers per numeric variable and store as numeric_outliers
 numeric_vars <- unname(unlist(lapply(data.raw, function(x) is.numeric(x))))
 numeric_outliers <- lapply(data.raw[,which(numeric_vars), with = F], function(x) tukey_outliers(x))
-summary(numeric_outliers)
+numeric_outliers %>% head(20) %>% summary
+```
+We identified columns with a lot of outliers...
 
+```{r EDA 3}
 # store names of outliers
 df <- which(lapply(numeric_outliers, length) > 10000)
-names(df)
-
-# visually inspect "fico_range_low" w/ boxplot
-boxplot(data.raw[,c("fico_range_low")], main = "Fico Range Low")
 
 # select only those outliers
 selected_numeric_vars <- data.raw[,names(df), with = F]
@@ -101,7 +105,15 @@ data.outliers$total_il_high_credit_limit_outlier <- selected_numeric_vars$total_
 data.outliers %<>% .[,!c("revol_bal", "tot_cur_bal", "avg_cur_bal", "bc_open_to_buy", "tot_hi_cred_lim", "total_bal_ex_mort", "total_il_high_credit_limit")]
 ```
 
+Inspection of the *fico_range_low* variable:
+```{r EDA 4}
+# visually inspect "fico_range_low" w/ boxplot
+boxplot(data.raw[,c("fico_range_low")], main = "Fico Range Low")
+```
+
 # Missing value handling
+We imputed missing values...
+
 ```{r missing value handling}
 # divide data set into subsets w. numeric and categorical data
 col.classes <- sapply(data.raw, class)
@@ -145,7 +157,11 @@ target <- data.raw[,.(id, default)]
 data.preprocessed <- merge(data.cat.features, data.imputed.num, by = "id") %>% 
   merge(target, by = "id") %>% merge(data.outliers, by = "id")
 ```
+
+
+
 # Feature engineering
+... built new features...
 ```{r feature engineering}
 # feature engineering
 data.preprocessed %<>% .[,`:=`(emp_title = as.factor(ifelse(str_detect(tolower(emp_title), "manager|director|ceo"),
@@ -175,6 +191,7 @@ data.preprocessed %<>% .[,`:=`(emp_title = as.factor(ifelse(str_detect(tolower(e
 ```
 
 # Feature selection
+... and selected the most predictive ones via variable importance out of a random forest:
 ```{r feature_selection}
 train <- data.preprocessed[data_source == "train"] %>% .[,!which(names(.) %in%
                                                                    c("id", "data_source")),
@@ -187,21 +204,16 @@ if(!file.exists("feat.selection.rds")) {
   fit <- readRDS("feat.selection.rds")
 } 
 
+# order features along their performance, choose 20 most important
 importance.feat <- importance(fit) %>% .[order(., decreasing = T)]
-importance.feat
+final.feat <- names(importance.feat)[1:20]
+final.feat
 
-top20.feat <- names(importance.feat)[1:20]
-top20.feat
-
-# manual.feat <- c("acc_now_delinq", "delinq_amnt", "fico_range_low", 
-#                  "num_tl_30dpd", "pct_tl_nvr_dlq", "revol_util")
-# 
-# final.feat <- union(top10.feat, manual.feat)
-final.feat <- top20.feat
 ```
 # Model tuning and evaluation
+
+## Selected models
 ```{r evaluation}
-library(caret)
 set.seed(2608)
 
 # train.data_set
@@ -259,64 +271,33 @@ if(!file.exists("m.xgboost.rds")) {
 } else {
   m.xgboost <- readRDS("m.xgboost.rds")
 }
-# # legacy code: directly learn xgboost model
-# library(xgboost)
-# library(forcats)
-# library(dummies)
-#   X_train <- train.data.all %>%
-#     dplyr::select(-default) %>% dummy.data.frame(verbose = T, drop = F) %>%
-#     as.matrix()
-#   y_train <- train.data.all$default %>% recode(no_default = 0, default = 1)
-#     
-#   # XGB ---------------------------------------------------------------------
-#   param <- list("objective" = "binary:logistic", #binary:logistic
-#                 "eval_metric" = "auc",
-#                 "eta" = 0.01,
-#                 "max_depth" = 7)
-#   
-#   cv.nfold <- 5
-#   
-#  m.xgb <- xgb.cv(param = param,
-#                 data = X_train,
-#                 label = y_train,
-#                 nfold = cv.nfold,
-#                 nrounds = 100)
-# 
-#  # best nrounds param:
-#  xgb.final <- xgboost(param = param,
-#                   data = X_train,
-#                   label = y_train,
-#                   nrounds = 100,
-#                   verbose = 1)
 ```
 
-# Performance evaluation
-```{r performance evaluation}
+## Performance evaluation
+```{r performance evaluation 1}
 # collect resamples
 results <- resamples(list(XGB=m.xgboost, RF=m.ranger))
-
 # summarize the distributions
 summary(results)
+```
+Insight 1
 
+```{r performance evaluation 2}
 # boxplots of results
 bwplot(results)
+```
+Insight 2
 
+```{r performance evaluation 3}
 # dot plots of results
 dotplot(results)
 ```
+Insight 3
 
-```{r make final predictions}
+# Final predictions
+```{r make final predictions, echo=TRUE, message=FALSE, warning=FALSE}
 test <- data.preprocessed[data_source == "test"] %>% .[,!which(names(.) == "data_source"), with = F]
-test$P_default <- predict(m.ranger, test, type = "prob")$default
+test$P_default <- predict(m.xgboost, test, type = "prob")$default
 final.predictions <- test[,.(id, P_default)] %>% as.data.frame
 write_csv(final.predictions, "6.csv")
-
-# # for xgb
-# X_test <- test %>%
-#   .[,top20.feat, with = F] %>% dummy.data.frame(verbose = T, drop = F) %>%
-#     as.matrix()
-# test.xgb <- test
-# test.xgb$P_default <- predict(xgb.final, X_test, type= "prob")
-# final.predictions.xgb <- test.xgb[,.(id, P_default)] %>% as.data.frame
-# write_csv(final.predictions.xgb, "6_xgb_experimental.csv")
 ```
