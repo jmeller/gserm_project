@@ -3,6 +3,7 @@ title: "Advanced Machine Learning with R - Project Report"
 author: "Jochen Hartmann and Jan Meller"
 subtitle: Default Predictions for the Lending Club Data Set
 output:
+  pdf_document: default
   html_notebook: default
 ---
 ```{r load packages, message=FALSE, warning=FALSE, include=FALSE}
@@ -15,15 +16,20 @@ suppressMessages(library(dplyr))
 suppressMessages(library(tidyverse))
 suppressMessages(library(visdat))
 suppressMessages(library(caret))
+suppressMessages(library(pROC))
+suppressMessages(library(plotROC))
 ```
 
 # Problem overview
-Some introductory sentences on the lending club data set and goal of project...
+
+The goal of this project is to predict Lending Club loans that go into default. The particular challenge of this problem arises from the width and the length of the data, i.e., the large number of potentially predictive features and the large number of loans in the training and test data. Hence, we slice the problem into smaller subproblems by (a) selecting the most relevant subset of features (i.e., reducing the width) and (b) training and tuning our initial models on a smaller subset of observations (i.e., reducing the length). This enables us to effectively and efficiently tackle this challenging problem and produce competitive performance in terms of AUC.
 
 # Data loading
 ```{r data_loading, results = "hide"}
-train.raw <- suppressWarnings(fread("lending_club_train.csv", stringsAsFactors = T))
-test.raw <- suppressWarnings(fread("lending_club_test.csv", stringsAsFactors = T))
+train.raw <- suppressWarnings(fread("lending_club_train.csv", 
+                                    stringsAsFactors = T))
+test.raw <- suppressWarnings(fread("lending_club_test.csv", 
+                                   stringsAsFactors = T))
 ```
 We received two data sets: 
 
@@ -32,14 +38,15 @@ We received two data sets:
 
 # Data cleaning
 
-In a first step, we combine both data sets to be able to perform subsequent preprocessing operations. Also, at this stage we apply first very basic data cleaning procedures.
+In a first step, we combine both data sets to be able to perform subsequent preprocessing operations. Also, at this stage we apply first very basic data cleaning procedures, e.g., converting feature types to factors and numerics. Lastly, we visually inspect the head of the combined dataset, called "data.raw".
 ```{r data_cleaning, message=FALSE, warning=FALSE}
 # combine train and test data for data handling
 data.raw <- union(
   # we add the data source so we can split it again later
   train.raw[, data_source := "train"],
   test.raw[, `:=`(data_source = "test",
-                  default = as.integer(default))] # casting to integer is necessary to combine both data sets
+                  default = as.integer(default))] 
+  # casting to integer is necessary to combine both data sets
 )
 
 # clean/transform features
@@ -56,7 +63,7 @@ head(data.raw[,2:8, with = F], 5)
 ```
 
 # Explorative data analysis
-Some explorative analyses...
+Before starting our actual analyses, we conduct explorative data analysis to get a better understanding of missing data, outliers, and data distribution. To start with, we explore the distribution of datatypes.
 
 ```{r EDA 1}
 summary(data.raw[,2:8, with = F]) # explore data using standard summary function
@@ -64,7 +71,8 @@ data.raw[1,] %>% vis_dat(sort_type = T) # explore distribution of data types
 ```
 
 ```{r EDA 2}
-sum(unlist(lapply(data.raw, function(x) is.numeric(x))))/ncol(data.raw) # compute share of numeric variables
+# compute share of numeric variables
+sum(unlist(lapply(data.raw, function(x) is.numeric(x))))/ncol(data.raw) 
 
 # detect outliers
 tukey_outliers <- function (x) {
@@ -80,10 +88,11 @@ tukey_outliers <- function (x) {
 
 # count number of outliers per numeric variable and store as numeric_outliers
 numeric_vars <- unname(unlist(lapply(data.raw, function(x) is.numeric(x))))
-numeric_outliers <- lapply(data.raw[,which(numeric_vars), with = F], function(x) tukey_outliers(x))
+numeric_outliers <- lapply(data.raw[,which(numeric_vars), with = F], 
+                           function(x) tukey_outliers(x))
 numeric_outliers %>% head(20) %>% summary
 ```
-We identified columns with a lot of outliers...
+As we expect outliers to be predictive of loan default, we create new outlier columns for all features with more than 10,000 outliers. Following research convention, we define outliers as values beyond 1.5 x IQR. Consequently, we identify seven variables with such a large number of outliers. Needless to say, some classifiers may directly learn from the data that outliers are particularly predictive. However, training time may be reduced and performance (potentially) improved through these additional hand-crafted features.
 
 ```{r EDA 3}
 # store names of outliers
@@ -94,15 +103,27 @@ selected_numeric_vars <- data.raw[,names(df), with = F]
 summary(selected_numeric_vars)
 
 # create new binary outlier columns
-data.outliers <- data.raw[,.(id, revol_bal, tot_cur_bal, avg_cur_bal, bc_open_to_buy, tot_hi_cred_lim, total_bal_ex_mort, total_il_high_credit_limit)]
-data.outliers$revol_bal_outlier <- selected_numeric_vars$revol_bal %in% tukey_outliers(selected_numeric_vars$revol_bal)
-data.outliers$tot_cur_bal_outlier <- selected_numeric_vars$tot_cur_bal %in% tukey_outliers(selected_numeric_vars$tot_cur_bal)
-data.outliers$avg_cur_bal_outlier <- selected_numeric_vars$avg_cur_bal %in% tukey_outliers(selected_numeric_vars$avg_cur_bal)
-data.outliers$bc_open_to_buy_outlier <- selected_numeric_vars$bc_open_to_buy %in% tukey_outliers(selected_numeric_vars$bc_open_to_buy)
-data.outliers$tot_hi_cred_lim_outlier <- selected_numeric_vars$tot_hi_cred_lim %in% tukey_outliers(selected_numeric_vars$tot_hi_cred_lim)
-data.outliers$total_bal_ex_mort_outlier <- selected_numeric_vars$total_bal_ex_mort %in% tukey_outliers(selected_numeric_vars$total_bal_ex_mort)
-data.outliers$total_il_high_credit_limit_outlier <- selected_numeric_vars$total_il_high_credit_limit %in% tukey_outliers(selected_numeric_vars$total_il_high_credit_limit)
-data.outliers %<>% .[,!c("revol_bal", "tot_cur_bal", "avg_cur_bal", "bc_open_to_buy", "tot_hi_cred_lim", "total_bal_ex_mort", "total_il_high_credit_limit")]
+data.outliers <- data.raw[,.(id, revol_bal, tot_cur_bal, avg_cur_bal, 
+                             bc_open_to_buy, tot_hi_cred_lim, total_bal_ex_mort, 
+                             total_il_high_credit_limit)]
+data.outliers$revol_bal_outlier <- selected_numeric_vars$revol_bal %in% 
+  tukey_outliers(selected_numeric_vars$revol_bal)
+data.outliers$tot_cur_bal_outlier <- selected_numeric_vars$tot_cur_bal %in% 
+  tukey_outliers(selected_numeric_vars$tot_cur_bal)
+data.outliers$avg_cur_bal_outlier <- selected_numeric_vars$avg_cur_bal %in% 
+  tukey_outliers(selected_numeric_vars$avg_cur_bal)
+data.outliers$bc_open_to_buy_outlier <- selected_numeric_vars$bc_open_to_buy %in% 
+  tukey_outliers(selected_numeric_vars$bc_open_to_buy)
+data.outliers$tot_hi_cred_lim_outlier <- selected_numeric_vars$tot_hi_cred_lim %in% 
+  tukey_outliers(selected_numeric_vars$tot_hi_cred_lim)
+data.outliers$total_bal_ex_mort_outlier <- selected_numeric_vars$total_bal_ex_mort %in% 
+  tukey_outliers(selected_numeric_vars$total_bal_ex_mort)
+data.outliers$total_il_high_credit_limit_outlier <- 
+  selected_numeric_vars$total_il_high_credit_limit %in% 
+  tukey_outliers(selected_numeric_vars$total_il_high_credit_limit)
+data.outliers %<>% 
+  .[,!c("revol_bal", "tot_cur_bal", "avg_cur_bal", "bc_open_to_buy", 
+        "tot_hi_cred_lim", "total_bal_ex_mort", "total_il_high_credit_limit")]
 ```
 
 Inspection of the *fico_range_low* variable:
@@ -112,7 +133,8 @@ boxplot(data.raw[,c("fico_range_low")], main = "Fico Range Low")
 ```
 
 # Missing value handling
-We imputed missing values...
+In our exploratory analysis, we found that a lot of features contained NA values. For this reason, in the next step we imputed these missing values by a relatively simple imputation logic: We separated the columns depending on their inherent data type into numeric features as well as categorical features. For the categorical features, we replaced the NA values by a new category "missing". For the numeric features, we replaced NA values by the mean values of all the non-NA values. However, we dropped columns with a fill rate of below 75% entirely. For each numeric column with missing values, we also added a new data missing indicator (dmi) feature which flagged instances where a values was imputed. Finally, we scaled and centred all numeric values to improve the performance of the subsequent classification algorithms.
+
 
 ```{r missing value handling}
 # divide data set into subsets w. numeric and categorical data
@@ -122,18 +144,23 @@ cat.features <- c(1, which(col.classes %in% c("factor", "logical", "character"))
 data.num.features <- data.raw[,num.features, with = F]
 data.cat.features <- data.raw[,cat.features, with = F]
 # exclude cols with less than 2 categories
-cat.levels <- data.cat.features[,lapply(.SD, function(col) length(unique(col)))] %>% unlist
+cat.levels <- data.cat.features[,lapply(.SD, 
+                                        function(col) length(unique(col)))] %>% 
+  unlist
 excl.cats <- which(cat.levels < 2)
 data.cat.features %<>% .[,!excl.cats, with = F] %>% .[,!"default", with = F]
 
 # cat features: replace NA w. "Missing"
 data.cat.features %<>% 
-  .[,lapply(.SD, function(col) ifelse(is.na(col), "Missing", as.character(col)))] %>%
+  .[,lapply(.SD, function(col) ifelse(is.na(col), "Missing", 
+                                      as.character(col)))] %>%
   .[,id := as.numeric(id)]
 
 # numeric features
-fill.rates.num <- data.num.features[,lapply(.SD, 
-                               function(col) sum(1 - as.integer(is.na(col)))/nrow(data.num.features)), 
+fill.rates.num <- 
+  data.num.features[,lapply(.SD, 
+                            function(col) sum(1 - as.integer(is.na(col)))/
+                              nrow(data.num.features)), 
                        .SDcols = names(data.num.features)] %>% unlist
 ## remove cols with > 75% missing data
 cols.wNAs.num <- fill.rates.num[which(fill.rates.num > 0.75)]
@@ -159,23 +186,25 @@ data.preprocessed <- merge(data.cat.features, data.imputed.num, by = "id") %>%
 ```
 
 
-
 # Feature engineering
-... built new features...
+In the subsequent feature engineering phase, we concentrated on the most predictive features from previous iterations: First we reduced the number of categories of the employment title. Also, we split up the features tracking the last credit payments into month and year. Also, we converted the rest of the categorical features into factor data types.
 ```{r feature engineering}
 # feature engineering
-data.preprocessed %<>% .[,`:=`(emp_title = as.factor(ifelse(str_detect(tolower(emp_title), "manager|director|ceo"),
-                                                 "executive",
-                                                 ifelse(str_detect(tolower(emp_title), "engineer|specialist"),
-                                                        "specialist",
-                                                        "other"))),
-                        last_credit_pull_d_month = as.factor(str_sub(last_credit_pull_d, 1,3)),
-                        last_credit_pull_d_year = as.factor(str_sub(last_credit_pull_d, 5,8)),
-                        last_credit_pull_d = NULL,
-                        earliest_cr_line_month = as.factor(str_sub(earliest_cr_line, 1,3)),
-                        earliest_cr_line_year = str_sub(earliest_cr_line, 5,8),
-                        earliest_cr_line = NULL,
-                        zip_2 = as.factor(str_sub(zip_code, 1, 2)))] %>%
+data.preprocessed %<>% 
+  .[,`:=`(emp_title = as.factor(ifelse(str_detect(tolower(emp_title), 
+                                                  "manager|director|ceo"),
+                                       "executive",
+                                       ifelse(str_detect(tolower(emp_title), 
+                                                         "engineer|specialist"),
+                                              "specialist",
+                                              "other"))),
+          last_credit_pull_d_month = as.factor(str_sub(last_credit_pull_d, 1,3)),
+          last_credit_pull_d_year = as.factor(str_sub(last_credit_pull_d, 5,8)),
+          last_credit_pull_d = NULL,
+          earliest_cr_line_month = as.factor(str_sub(earliest_cr_line, 1,3)),
+          earliest_cr_line_year = str_sub(earliest_cr_line, 5,8),
+          earliest_cr_line = NULL,
+          zip_2 = as.factor(str_sub(zip_code, 1, 2)))] %>%
   .[,`:=`(length_bs_rel = (2018 - as.integer(earliest_cr_line_year)),
           earliest_cr_line_year = as.factor(earliest_cr_line_year),
           zip_code = NULL, term = as.factor(term),
@@ -191,11 +220,10 @@ data.preprocessed %<>% .[,`:=`(emp_title = as.factor(ifelse(str_detect(tolower(e
 ```
 
 # Feature selection
-... and selected the most predictive ones via variable importance out of a random forest:
+In order to handle the amount of data and hence balance model complexity with computational cost, we decided to select only the 20 most predictive features for our final model training phase. To this end, we trained a small random forest with 20 trees on the whole data set. We then took the internally calculated importance metric as a selection criterion to rank all available features and choose the 20 most important ones.  
 ```{r feature_selection}
-train <- data.preprocessed[data_source == "train"] %>% .[,!which(names(.) %in%
-                                                                   c("id", "data_source")),
-                                                         with = F]
+train <- data.preprocessed[data_source == "train"] %>% 
+  .[,!which(names(.) %in% c("id", "data_source")), with = F]
 # random forest model
 if(!file.exists("feat.selection.rds")) {
   fit <- ranger(default ~ ., train, importance = "impurity", num.trees = 20)
@@ -210,15 +238,17 @@ final.feat <- names(importance.feat)[1:20]
 final.feat
 
 ```
+
 # Model tuning and evaluation
+In the final model training phase, we reverted to two powerful classification models: First, we chose a random forest due to its versatility in a wide range of scenarios and its proven highly robustness in terms of performance. Secondly, we tested the extreme gradient boosting algorithm which has also proven to perform very well in a wide range of application scenarios. Both models were tuned via the caret package over a reasonable range of tuning parameters and the best two models are evaluated subsequently.
 
 ## Selected models
 ```{r evaluation}
 set.seed(2608)
 
 # train.data_set
-train <- data.preprocessed[data_source == "train"] %>% .[,!which(names(.) %in% 
-                                                                   c("id", "data_source")), 
+train <- data.preprocessed[data_source == "train"] %>% 
+  .[,!which(names(.) %in% c("id", "data_source")), 
                                                          with = F] 
 train.data.all <- train[, c("default", final.feat), with = F]
 train.data.subset <- train.data.all[sample(1:nrow(train), 5000)]
@@ -235,7 +265,8 @@ ctrl <- trainControl(
 # random forest model
 if(!file.exists("m.ranger.rds")) {
   
-  ranger.grid <- expand.grid(mtry = c(4,5), splitrule = "gini", min.node.size = 1)
+  ranger.grid <- expand.grid(mtry = c(4,5), splitrule = "gini", 
+                             min.node.size = 1)
   # train actual model
   m.ranger <- train(default ~ .,
                     data = train.data.all,
@@ -274,30 +305,71 @@ if(!file.exists("m.xgboost.rds")) {
 ```
 
 ## Performance evaluation
+To compare the performance of our tree-based ensemble classifiers, i.e., XGBoost and Random Forest, we first consolidate the models in the "results" object and then apply standard functions from the "caret" package to visually inspect the differences. XGBoost slightly outperforms Random Forest in terms of ROC with 83.4 compared to 82.6. While XGBoost yields a lower sensitivity, it outperforms Random Forest significantly in specificity. Overall, our results suggest that both methods are a reasonable choice for the problem at hand - and while XGBoost might slightly outperform Random Forest, it requires more expert knowledge for set-up, tuning, and interpretation.
 ```{r performance evaluation 1}
 # collect resamples
 results <- resamples(list(XGB=m.xgboost, RF=m.ranger))
 # summarize the distributions
 summary(results)
 ```
-Insight 1
+
+```{r roc}
+
+# plot roc curves
+ranger.pred <- m.ranger$pred[m.ranger$pred$mtry == 5,] %>% 
+  mutate(obs = fct_relevel(obs, "default", after = 1),
+         obs_int = as.integer(obs) - 1,
+         `random forest` = default)
+xgb.pred <- m.xgboost$pred[m.xgboost$pred$nrounds == 150 & 
+                        m.xgboost$pred$max_depth == 6 & 
+                        m.xgboost$pred$eta == 0.3,] %>% 
+  mutate(obs = fct_relevel(obs, "default", after = 1),
+         obs_int = as.integer(obs) - 1,
+         `xgb` = default)
+plot.data <- merge(ranger.pred, xgb.pred, by = c("rowIndex", "obs_int")) %>% 
+  select(rowIndex, obs_int, `random forest`, `xgb`) %>%
+  gather(key, value, `random forest`, `xgb`)
+
+roc.plot <- ggplot(plot.data, aes(d=obs_int, m=value, color = key)) + 
+  geom_roc(n.cuts=0) + 
+  coord_equal() +
+  style_roc() +
+  scale_color_grey(name="Models", start = .7, end = .3) 
+roc.plot <- roc.plot + 
+  annotate("text", x=0.75, y=0.25, 
+           label=paste("AUC RF =", round((calc_auc(roc.plot))$AUC[1], 4))) +
+  annotate("text", x=0.75, y=0.15, 
+           label=paste("AUC XGB =", round((calc_auc(roc.plot))$AUC[2], 4)))
+roc.plot
+```
+The ROC curves depicted above also confirm our results graphically - both algorithms perform very similar with a slightly higher specificity of the xgboost model. We deduct from the ROC graph that the random forest algorithm is dominated by xgboost since it does not lie on the convex hull of classifiers and hence cannot be an optimal choice of classifier.
+
 
 ```{r performance evaluation 2}
 # boxplots of results
 bwplot(results)
 ```
-Insight 2
 
 ```{r performance evaluation 3}
 # dot plots of results
 dotplot(results)
 ```
-Insight 3
+Also, the two previous graphs show that our results seem highly stable across the cross-validation folds. For this reason, we choose the xgboost model for our final predictions.
 
 # Final predictions
 ```{r make final predictions, echo=TRUE, message=FALSE, warning=FALSE}
-test <- data.preprocessed[data_source == "test"] %>% .[,!which(names(.) == "data_source"), with = F]
+test <- data.preprocessed[data_source == "test"] %>% 
+  .[,!which(names(.) == "data_source"), with = F]
 test$P_default <- predict(m.xgboost, test, type = "prob")$default
 final.predictions <- test[,.(id, P_default)] %>% as.data.frame
 write_csv(final.predictions, "6.csv")
 ```
+
+# Conclusion
+In summary, the lending club data set challenged us along multiple dimensions:
+
+- We learned that Big Data can be both wide and long  $\longrightarrow$ both types pose different challenges, i.e., in terms of selecting relevant features as well as concerning computational cost of the final model training
+- Machine learning methods can help not only for the final predictions but also in understanding important drivers of the outcome and hence help at feature selection: As an example we used the variable importance of a random forest. Also, we experimented with single decision trees and evaluated the splits at the highes nodes. 
+- Moreover, we observed that iterating quickly and hence testing models on only small subsets can beat the benefit of increased accuracy on the whole data set at feature engineering and model selection phase. For our purposes in terms of model tuning, we experienced that 5-fold cross validation provided us with sufficiently stable results and we would revert to 10-fold cv or even repeated CV only when statistical significance of differences between methods are relevant
+- In our opinion, tree-based ensembles provide a great trade-off between computational efficiency and classification performance; Deep neural networks might outperform them, but at much higher computational cost and requiring significantly higher expert knowledge for set-up and tuning
+- Business take-away: each percentage point difference in AUC translates into direct monetary impact for Lending club – hence, the project at hand did not serve mere academic purpose as a theoretical exercise but turned out to be a case study of high practical relevance.
